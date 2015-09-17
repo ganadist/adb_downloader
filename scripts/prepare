@@ -1,0 +1,113 @@
+#!/dev/d/busybox ash
+# vim:syntax=sh
+#
+# script to prepare downloader environment
+
+IMAGE_ROOT="/dev/d"
+
+BUSYBOX="$IMAGE_ROOT/busybox"
+
+START="/system/bin/toolbox start"
+STOP="/system/bin/toolbox stop"
+VDC="/system/bin/vdc"
+GETPROP="/system/bin/toolbox getprop"
+INSTALLER="$IMAGE_ROOT/installer"
+
+COMMAND_PORT=9123
+RESPONSE_PORT=9124
+CONTENT_PORT=9125
+
+print()
+{
+  echo "TARGET: " "$@"
+}
+
+call()
+{
+  print "$@"
+  $@
+}
+
+install_busybox()
+{
+  for CMD in sh ls chmod gzip grep sed cut sort mount umount dd mkdir sleep ln killall true false fdisk
+  do
+    $BUSYBOX ln -s $BUSYBOX $1/$CMD
+  done
+}
+
+kill_services()
+{
+  # unmount before shutdown vold
+  VOLUMES=`vdc volume list | cut -d ' ' -f 3`
+  for S in $VOLUMES
+  do
+    call $VDC volume unmount /storage/$S
+  done
+
+  # kill all services
+  SERVICES=`$GETPROP | grep svc | sed -e 's@\[init.svc.\(.*\)\]:\(.*\)@\1@'`
+  for S in $SERVICES
+  do
+    # adb must survive
+    if [ $S = "adbd" ]; then
+      continue
+    fi
+    # do not kill console service for debugging
+    if [ $S = "console" ]; then
+      continue
+    fi
+    call $STOP $S
+  done
+}
+
+
+unmount_all_disk()
+{
+  FUSE=`grep fuse /proc/mounts | cut -d ' ' -f 2 | sort -r`
+  for P in $FUSE
+  do
+    call umount -l $P
+  done
+
+  # kill processes for unmount filesystems
+  kill_services
+  kill 1
+  busybox fuser -m /data
+  busybox fuser -m -9 /data
+  busybox fuser -m /system
+  kill -9 `busybox fuser -m -9 /system`
+
+  sleep 1
+
+  EXT4=`grep ext4 /proc/mounts | cut -d ' ' -f 2 | grep -v system | sort -r`
+  for P in $EXT4
+  do
+    call umount -l $P
+  done
+
+  # print results
+  mount
+  ps
+
+  call $STOP console
+
+  if umount /system; then
+    # make emergency shell for adb
+    mount -o remount,rw /
+    mkdir -p /system/bin
+    install_busybox /system/bin/
+  else
+    true
+  fi
+}
+
+main()
+{
+  install_busybox $IMAGE_ROOT/
+  export PATH=$IMAGE_ROOT:$PATH
+  unmount_all_disk
+  $INSTALLER
+}
+
+main

@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+
+DSTDIR = '/dev/d/'
+SRCDIR = os.path.dirname(sys.argv[0]) or '.'
+MMC = '/dev/block/mmcblk0'
+
+def adb(cmd):
+    os.system('adb ' + cmd)
+
+def prepare():
+    adb('shell mkdir -p ' + DSTDIR)
+    adb('push %s/busybox %s'%(SRCDIR, DSTDIR))
+
+
+clear_part="""p
+d
+4
+d
+3
+d
+2
+d
+"""
+
+class Part:
+    def __init__(self, dev, start, end, type):
+        self.dev = int(dev[len(MMC) + 1:])
+        self.start = start
+        self.end = end
+        self.type = type
+
+    def getCreateCmd(self):
+        if self.dev < 4:
+            return """n\np\n%d\n%s\n%s\n"""%(self.dev, self.start, self.end)
+        elif self.dev == 4:
+            return """n\ne\n%s\n%s\n"""%(self.start, self.end)
+        else:
+            return """n\n%s\n%s\n"""%(self.start, self.end)
+
+    def getTypeCmd(self):
+        return """t\n%d\n%s\n"""%(self.dev, self.type)
+
+    def __repr__(self):
+        return 'p%d start:%s end:%s type:%s'%(self.dev, self.start, self.end, self.type)
+
+def readpart():
+    parts = []
+    for line in os.popen('adb shell /dev/d/busybox fdisk -l ' + MMC):
+        if not line.startswith('/dev/'):
+            continue
+        line = line[:-1]
+        dev, start, end, blksize, type, typeLabel = line.split(None, 5)
+        parts.append(Part(dev, start, end, type))
+
+    return parts
+
+def generateFdiskCmd(parts, out):
+    cmd = ""
+    cmd += clear_part
+    for p in parts:
+        cmd += p.getCreateCmd()
+    for p in parts:
+        cmd += p.getTypeCmd()
+    # FIXME
+    if False:
+        cmd += "p\nq\n"
+    else:
+        cmd += "p\nw\n"
+    out.write(cmd)
+
+def main():
+    if len(sys.argv) == 1:
+        out = sys.stdout
+    elif len(sys.argv) == 2:
+        out = open(sys.argv[1], 'w')
+    else:
+        print('usage: %s [filename]'%(sys.argv[0]))
+        sys.exit(-1)
+    prepare()
+    p = readpart()
+    generateFdiskCmd(p, out)
+
+if __name__ == '__main__':
+    main()

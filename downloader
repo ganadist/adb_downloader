@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+# coding: utf8
+
+from importlib.machinery import SourceFileLoader
+import sys, os
+import socket, time
+import subprocess
+import tempfile
+
+DIRNAME = os.path.dirname(__file__)
+PREBUILTS_HOST = os.path.join(DIRNAME, 'prebuilts', 'host', sys.platform)
+PREBUILTS_TARGET = os.path.join(DIRNAME, 'prebuilts', 'target')
+TARGET_SCRIPT_DIR = os.path.join(DIRNAME, 'scripts' )
+CONFIG_DIR = os.path.join(DIRNAME, 'config')
+
+TARGET_PREBUILTS_BINARIES = ('busybox', 'installer')
+TARGET_COMMON_SCRIPTS = ('prepare', )
+TARGET_COMMON_SCRIPTS = [os.path.join(TARGET_SCRIPT_DIR, filename) for filename in TARGET_COMMON_SCRIPTS]
+
+ADB = os.path.join(PREBUILTS_HOST, 'adb')
+SIMG2IMG = os.path.join(PREBUILTS_HOST, 'simg2img')
+COMMAND_PORT = 9123
+
+DOWNLOAD_DIR = '/dev/d/'
+BLK_DISK = '/dev/block/mmcblk0'
+
+class AdbException(Exception):
+    def __init__(self, code, msg):
+        Exception.__init__(self, code, msg)
+
+    def __repr__(self):
+        code, msg = self.args
+        return 'AdbException: code:%s %s'%(code, msg)
+
+class DownloaderError(Exception):
+    def __init__(self, msg):
+        Exception.__init__(self, msg)
+
+    def __repr__(self):
+        msg, = self.args
+        return 'DownloaderError: ' + msg
+
+class Adb:
+    SERIAL_NO = None
+    def adb(f):
+        def wrap(*args, **kwds):
+            cmd = f(*args, **kwds)
+            if not cmd:
+                cmd = (f.__name__, ) + args
+
+            if Adb.SERIAL_NO:
+                cmd = (ADB, '-s', Adb.SERIAL_NO) + cmd
+            else:
+                cmd = (ADB, ) + cmd
+
+            proc = subprocess.Popen(cmd, stdout = subprocess.PIPE)
+            proc.wait()
+            output = proc.stdout.read().strip().decode('utf8')
+            if proc.returncode != 0:
+                raise AdbException(proc.returncode, output)
+            return output
+        return wrap
+
+    @staticmethod
+    @adb
+    def push(*args):
+        pass
+
+    @staticmethod
+    @adb
+    def shell(*args):
+        pass
+
+    @staticmethod
+    @adb
+    def forward(src, dst = None):
+        if dst is None:
+            dst = src
+        return ('forward', 'tcp:%d'%src, 'tcp:%d'%dst)
+
+    @staticmethod
+    @adb
+    def serial(*args):
+        return ('get-serialno', )
+
+    @staticmethod
+    @adb
+    def getprop(*args):
+        return ('shell', 'getprop') + args
+
+    @staticmethod
+    @adb
+    def root(*args):
+        pass
+
+    @staticmethod
+    @adb
+    def wait(*args):
+        return ('wait-for-device', )
+
+    @staticmethod
+    @adb
+    def devices(*args):
+        pass
+
+def select_device(serial_no = None):
+    devices = tuple(map(lambda x: x.split()[0], Adb.devices().split('\n')[1:]))
+    if not devices:
+        raise DownloaderError('there is no connected android device')
+
+    if not serial_no:
+        serial_no = os.getenv('ANDROID_SERIAL', devices[0])
+        print('selected device is', serial_no)
+
+    if not serial_no in devices:
+        raise DownloaderError('android device named %s is not connected'%serial_no)
+
+    return serial_no
+
+
+class SparseImage(tempfile.TemporaryDirectory):
+    def __init__(self, src):
+        tempfile.TemporaryDirectory.__init__(self)
+        self.src = src
+
+    def __enter__(self):
+        dst = os.path.join(self.name, os.path.basename(self.src))
+        cmd = '%s %s %s'%(SIMG2IMG, self.src, dst)
+        os.system(cmd)
+        return dst
+
+class Device:
+    def __init__(self, serial_no = None):
+        self.abilist = []
+        self.names = []
+        self.tables = {}
+        Adb.SERIAL_NO = select_device(serial_no)
+        self.prepare()
+        self.load_fstab()
+
+    def set_downloader(self, downloader):
+        self.downloader = downloader
+
+    def prepare(self):
+        debuggable = Adb.getprop('ro.debuggable')
+        if debuggable != '1':
+            raise DownloaderError('android device is not writable')
+
+        user = Adb.shell('id')
+        if not user.startswith('uid=0'):
+            Adb.root()
+            Adb.wait()
+            user = Adb.shell('id')
+            if not user.startswith('uid=0'):
+                raise DownloaderError('adb must be run with root, but output is ' + repr(user))
+
+        config_path = self.get_config_path()
+        try:
+            target_module = SourceFileLoader('target', os.path.join(config_path,
+                'target.py')).load_module()
+        except:
+            raise DownloaderError('not supported platform')
+        self.target = target_module.Target()
+
+    def prepare_prebuilts(self):
+        Adb.shell('mkdir', '-p', DOWNLOAD_DIR)
+
+        binaries = self.get_prebuilt_binaries()
+
+        common_path = ''
+        scripts = TARGET_COMMON_SCRIPTS
+
+        target_module_path = self.get_config_path()
+        target_binaries = [os.path.join(target_module_path, filename) for filename in
+                self.target.get_prebuilt_binaries()]
+
+        for binary in binaries + scripts + target_binaries:
+            Adb.push(binary, DOWNLOAD_DIR)
+            Adb.shell('chmod', '755', DOWNLOAD_DIR + '/' + os.path.basename(binary))
+
+
+    def load_fstab(self):
+        hardware = Adb.getprop('ro.hardware')
+        fstab = Adb.shell('cat', 'fstab.' + hardware)
+        for line in fstab.split('\n'):
+            line = line.strip()
+            if not line.startswith('/dev/block'):
+                continue
+
+            part, mnt_point, fstype, mnt_flags, fs_mgr_flags = line.split(None, 4)
+            self.tables[mnt_point[1:]] = part
+
+        self.tables.update(self.target.get_partitions())
+
+        if 'data' in self.tables:
+            self.tables['userdata'] = self.tables['data']
+
+    def get_partitions(self):
+        return self.tables
+
+    def get_part(self, partName):
+        if partName in self.tables:
+            return self.tables[partName]
+
+        # XXX
+        platform_busname = 'msm_sdcc.1'
+        if partName == 'data':
+            partName = 'userdata'
+        return '/dev/block/platform/' + platform_busname + '/by-name/' + partname
+
+    def get_abi(self):
+        if not self.abilist:
+            abilist = Adb.getprop('ro.product.cpu.abilist')
+            print(abilist)
+            if abilist:
+                abilist = abilist.split(',')
+            else:
+                abilist = []
+                for prop in ('ro.product.cpu.abi', 'ro.product.cpu.abi2'):
+                    abi = Adb.getprop(prop)
+                    print(abi)
+                    if abi:
+                        abilist.append(abi)
+            self.abilist = abilist
+        return self.abilist
+
+    def get_names(self):
+        if not self.names:
+            props = ('ro.product.name', 'ro.product.device', 'ro.product.board', 'ro.board.platform')
+            for prop in props:
+                name = Adb.getprop(prop)
+                if name and not name in self.names:
+                    self.names.append(name)
+        return self.names
+
+    def get_prebuilt_path(self):
+        for abi in self.get_abi():
+            path = os.path.join(PREBUILTS_TARGET, abi)
+            if os.path.isdir(path):
+                return path
+        else:
+            raise DownloaderError('not supported abi:' + repr(self.abilist))
+
+    def get_prebuilt_binaries(self):
+        path = self.get_prebuilt_path()
+        files = [os.path.join(path, filename) for filename in TARGET_PREBUILTS_BINARIES]
+
+        return files
+
+    def get_config_path(self):
+        names = self.get_names()
+        for name in names:
+            path = os.path.join(CONFIG_DIR, name)
+            if os.path.isdir(path):
+                return path
+        else:
+            raise DownloaderError('not supported platform:' + repr(names))
+
+    def write_all(self):
+        pass
+
+    def write(self, part, filename = None):
+        if not filename:
+            filename = part + '.img'
+
+        if not os.path.dirname(filename):
+            OUT = os.getenv('OUT', '')
+            filename = os.path.join(OUT, filename)
+
+        target_downloader = self.target.get_part_handler(part)
+        if target_downloader:
+            target_downloader(self.downloader, part, filename)
+        else:
+            KNOWN_PART = ('boot', 'system', 'recovery')
+            if part in KNOWN_PART:
+                self.downloader.write(part, filename)
+            else:
+                self.downloader.clear_partition(part)
+
+    def finalize(self):
+        for part in ('system', 'cache', 'data'):
+            block = self.get_part(part)
+            mntpnt = '/' + part
+            self.downloader.mount(block, mntpnt)
+
+        self.target.handle_exit(self.downloader)
+
+
+class Downloader:
+    def __init__(self, device):
+        self.proc = None
+        self.device = device
+        self.written = False
+        self.device.set_downloader(self)
+
+    def __enter__(self):
+        Adb.forward(COMMAND_PORT)
+        self.device.prepare_prebuilts()
+
+        cmd = (ADB, '-s', Adb.SERIAL_NO, 'shell', 'exec', DOWNLOAD_DIR + '/prepare')
+        self.proc = subprocess.Popen(cmd)
+        self.wait()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        written = self.written
+        self.device.finalize()
+
+        self.cmd('setprop ctl.start console')
+        if written:
+            self.cmd('reboot')
+        self.cmd('exit')
+        self.proc.wait()
+
+    def cmd(self, cmd):
+        print('send cmd:', cmd)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect(('localhost', COMMAND_PORT))
+        cmd = cmd + '\n'
+        cmd = cmd.encode('utf8')
+        sock.send(cmd)
+        buf = b''
+        try:
+            buf = sock.recv(4096)
+            sock.close()
+        except: pass
+        return buf.decode('utf8')
+
+    def wait(self):
+        while True:
+            out = self.cmd('ping')
+            if out == 'pong':
+                return
+            time.sleep(1)
+
+    def detect_filetype(f):
+        def wrap(self, device, filename):
+            if False:
+                with SparseImage(filename) as tempfile:
+                    return f(self, device, tempfile)
+            return f(self, device, filename)
+        return wrap
+
+    @detect_filetype
+    def write(self, device, filename):
+        if not os.access(filename, os.R_OK):
+            print('no such file:', filename)
+            return
+        self.wait()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect(('localhost', COMMAND_PORT))
+        cmd = 'write %s\n'%device
+        print('send cmd:', cmd)
+        cmd = cmd + '\n'
+        cmd = cmd.encode('utf8')
+        sock.send(cmd)
+
+        gzip = ('gzip', '-c', '-9', filename)
+
+        p = subprocess.Popen(gzip, stdout = subprocess.PIPE)
+        while True:
+            buf = p.stdout.read(16 * 1024)
+            if not buf:
+                break
+            sock.send(buf)
+        print('gzip result:', p.wait())
+        self.written = True
+
+    def run(self, cmd):
+        self.wait()
+        self.cmd('run ' + cmd)
+
+    def fdisk(self):
+        self.run('%(busybox)s fdisk %(disk)s < %(fdisk_cmd)s'%{
+            'busybox': DOWNLOAD_DIR + '/busybox',
+            'disk': BLK_DISK,
+            'fdisk_cmd': DOWNLOAD_DIR + '/fdisk_cmd'
+        })
+
+    def clear_partition(self, part, count = 4096):
+        self.run('dd if=/dev/zero of=%s bs=1024 count=%d'%(part, count))
+
+    def mount(self, part, mntpnt):
+        self.run('mount -t ext4 %s %s'%(part, mntpnt))
+
+if __name__ == '__main__':
+    import getopt
+    optlist, args = getopt.getopt(sys.argv[1:], 's:')
+    for optkey, optvalue in optlist:
+        if optkey == '-s':
+            serial_no = optvalue
+            break
+    else:
+        serial_no = ''
+    device = Device(serial_no)
+
+    partitions = device.get_partitions()
+    available_args = ('all', ) + tuple(partitions.keys())
+
+    if set(args) - set(available_args) or not args:
+        print('Usage: %s %s'%(sys.argv[0], available_args))
+        sys.exit(1)
+
+    with Downloader(device) as down:
+        if 'all' in args:
+            device.write_all()
+        else:
+            for part in args:
+                device.write(part)
+
