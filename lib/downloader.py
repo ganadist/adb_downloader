@@ -1,7 +1,8 @@
 # coding: utf8
 
-import sys, os
+import sys, os, errno
 import socket, time
+import struct
 import subprocess
 import tempfile
 
@@ -13,6 +14,35 @@ class DownloaderError(Exception):
         msg, = self.args
         return 'DownloaderError: ' + msg
 
+
+def is_sparse_file(filename):
+    FH = open(filename, 'rb')
+    header_bin = FH.read(28)
+    header = struct.unpack('<I4H4I', header_bin)
+
+    magic = header[0]
+    major_version = header[1]
+    minor_version = header[2]
+    file_hdr_sz = header[3]
+    chunk_hdr_sz = header[4]
+    blk_sz = header[5]
+    total_blks = header[6]
+    total_chunks = header[7]
+    image_checksum = header[8]
+
+    if magic != 0xED26FF3A:
+        return False
+
+    if major_version != 1 or minor_version != 0:
+        return False
+
+    if file_hdr_sz != 28:
+        return False
+
+    if chunk_hdr_sz != 12:
+        return False
+
+    return True
 
 class SparseImage(tempfile.TemporaryDirectory):
     def __init__(self, src):
@@ -31,14 +61,14 @@ class Downloader:
     def __init__(self, device):
         self.proc = None
         self.device = device
-        self.written = False
         self.device.set_downloader(self)
+        self.written = False
 
     def __enter__(self):
         Adb.forward(g.COMMAND_PORT)
         self.device.prepare_prebuilts()
 
-        cmd = (ADB, '-s', Adb.SERIAL_NO, 'shell',
+        cmd = (g.ADB, '-s', Adb.SERIAL_NO, 'shell',
                 'exec', g.DOWNLOAD_DIR + '/prepare')
         self.proc = subprocess.Popen(cmd)
         self.wait()
@@ -55,7 +85,6 @@ class Downloader:
         self.proc.wait()
 
     def cmd(self, cmd):
-        print('send cmd:', cmd)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect(('localhost', g.COMMAND_PORT))
         cmd = cmd + '\n'
@@ -77,7 +106,7 @@ class Downloader:
 
     def detect_filetype(f):
         def wrap(self, device, filename):
-            if False:
+            if is_sparse_file(filename):
                 with SparseImage(filename) as tempfile:
                     return f(self, device, tempfile)
             return f(self, device, filename)
@@ -85,14 +114,21 @@ class Downloader:
 
     @detect_filetype
     def write(self, device, filename):
+        """ Write file on block device on target
+
+        Args:
+            device (string): block device filename on target
+            filename (string): filename on host
+
+        Returns:
+            int: If successed 0 or -1
+        """
         if not os.access(filename, os.R_OK):
-            print('no such file:', filename)
-            return
+            raise OSError(errno.ENOENT, "no such filename")
         self.wait()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect(('localhost', g.COMMAND_PORT))
         cmd = 'write %s\n'%device
-        print('send cmd:', cmd)
         cmd = cmd + '\n'
         cmd = cmd.encode('utf8')
         sock.send(cmd)
@@ -105,24 +141,25 @@ class Downloader:
             if not buf:
                 break
             sock.send(buf)
-        print('gzip result:', p.wait())
         self.written = True
+        return p.returncode
 
-    def run(self, cmd):
+    def system(self, command):
+        """ Run command on target device and return stdout
+
+        Args:
+            command (string): command to run on target
+
+        Returns:
+            string: stdout when run command on target
+        """
         self.wait()
-        self.cmd('run ' + cmd)
-
-    def fdisk(self):
-        self.run('%(busybox)s fdisk %(disk)s < %(fdisk_cmd)s'%{
-            'busybox': g.DOWNLOAD_DIR + '/busybox',
-            'disk': g.BLK_DISK,
-            'fdisk_cmd': g.DOWNLOAD_DIR + '/fdisk_cmd'
-        })
+        return self.cmd('run ' + command)
 
     def clear_partition(self, part, count = 4096):
-        self.run('dd if=/dev/zero of=%s bs=1024 count=%d'%(part, count))
+        self.system('dd if=/dev/zero of=%s bs=1024 count=%d'%(part, count))
 
     def mount(self, part, mntpnt):
-        self.run('mount -t ext4 %s %s'%(part, mntpnt))
+        self.system('mount -t ext4 %s %s'%(part, mntpnt))
 
 
