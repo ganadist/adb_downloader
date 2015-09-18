@@ -35,13 +35,19 @@ class Adb:
 
     @staticmethod
     @adb
-    def push(*args):
-        pass
+    def devices(*args): pass
 
     @staticmethod
     @adb
-    def shell(*args):
-        pass
+    def push(*args): pass
+
+    @staticmethod
+    @adb
+    def root(*args): pass
+
+    @staticmethod
+    @adb
+    def shell(*args): pass
 
     @staticmethod
     @adb
@@ -52,28 +58,18 @@ class Adb:
 
     @staticmethod
     @adb
-    def serial(*args):
-        return ('get-serialno', )
-
-    @staticmethod
-    @adb
     def getprop(*args):
         return ('shell', 'getprop') + args
 
     @staticmethod
     @adb
-    def root(*args):
-        pass
+    def serial(*args):
+        return ('get-serialno', )
 
     @staticmethod
     @adb
     def wait(*args):
         return ('wait-for-device', )
-
-    @staticmethod
-    @adb
-    def devices(*args):
-        pass
 
 def select_device(serial_no = None):
     devices = tuple(map(lambda x: x.split()[0], Adb.devices().split('\n')[1:]))
