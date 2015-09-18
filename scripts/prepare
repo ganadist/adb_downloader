@@ -72,12 +72,11 @@ unmount_all_disk()
 
   # kill processes for unmount filesystems
   kill_services
-  kill 1
+  sleep 1
   busybox fuser -m /data
   busybox fuser -m -9 /data
   busybox fuser -m /system
   kill -9 `busybox fuser -m -9 /system`
-
   sleep 1
 
   EXT4=`grep ext4 /proc/mounts | cut -d ' ' -f 2 | grep -v system | sort -r`
@@ -91,6 +90,7 @@ unmount_all_disk()
   ps
 
   call $STOP console
+  sleep 1
 
   if umount /system; then
     # make emergency shell for adb
