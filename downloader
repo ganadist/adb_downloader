@@ -2,6 +2,7 @@
 # coding: utf8
 
 import lib
+from lib import adb
 import sys, os
 
 if __name__ == '__main__':
@@ -13,7 +14,9 @@ if __name__ == '__main__':
             break
     else:
         serial_no = ''
-    device = Device(serial_no)
+    Adb.SERIAL_NO = adb.select_device(serial_no)
+
+    device = Device()
 
     partitions = device.get_partitions()
     available_args = ('all', ) + tuple(partitions.keys())
@@ -21,6 +24,8 @@ if __name__ == '__main__':
     if set(args) - set(available_args) or not args:
         print('Usage: %s %s'%(sys.argv[0], available_args))
         sys.exit(1)
+
+    device.check_partition_files(args)
 
     with Downloader(device) as down:
         if 'all' in args:
