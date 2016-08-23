@@ -79,6 +79,9 @@ unmount_all_disk()
   kill -9 `busybox fuser -m -9 /system`
   sleep 1
 
+  # remount system with rw
+  call mount -o remount,rw none /system
+
   EXT4=`grep ext4 /proc/mounts | cut -d ' ' -f 2 | grep -v system | sort -r`
   for P in $EXT4
   do
