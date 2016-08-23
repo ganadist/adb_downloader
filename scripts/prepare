@@ -107,7 +107,8 @@ main()
   install_busybox $IMAGE_ROOT/
   export PATH=$IMAGE_ROOT:$PATH
   unmount_all_disk
-  $INSTALLER
+  echo -n -1000 > /proc/self/oom_score_adj
+  exec $INSTALLER
 }
 
 main
